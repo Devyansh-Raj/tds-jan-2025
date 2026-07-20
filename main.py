@@ -203,28 +203,31 @@ async def q3_answer(request: Request):
     question = body.get("question", "")
     chunks = body.get("chunks", [])
     prompt = (
-        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
-        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
-        "   - answerable: false\n"
-        "   - answer: \"I don't know\" (exact match)\n"
-        "   - citations: [] (empty array)\n"
-        "   - confidence: 0.1\n"
-        "2. If it CAN be answered, return:\n"
-        "   - answerable: true\n"
-        "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
-        "   - confidence: <float between 0.8 and 1.0>\n"
-        "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
+        "You are a strict Grounded QA API. Evaluate if the question can be answered strictly using ONLY the provided chunks.\n"
+        "If the chunks lack the explicit information, you MUST return:\n"
+        '{"answerable": false, "answer": "I don\'t know", "citations": [], "confidence": 0.1}\n'
+        "If the chunks DO contain the information, return:\n"
+        '{"answerable": true, "answer": "<factual answer>", "citations": ["C1", "C2"], "confidence": 0.95}\n'
+        "Return strictly JSON.\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1000))
-        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
+        
+        # Safely parse the boolean in case the LLM returns a string like "false"
+        is_answerable = out.get("answerable", False)
+        if str(is_answerable).lower() in ["false", "0", "none", ""]:
+            is_answerable = False
+        else:
+            is_answerable = True
+            
+        if not is_answerable or float(out.get("confidence", 1.0)) <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+            
         valid_ids = [c["chunk_id"] for c in chunks]
         cites = [c for c in out.get("citations", []) if c in valid_ids]
+        
         return {
             "answer": out.get("answer", "I don't know"),
             "citations": cites,
@@ -233,7 +236,6 @@ async def q3_answer(request: Request):
         }
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
     norm_a = np.linalg.norm(a)
@@ -292,9 +294,9 @@ async def extract_graph(request: Request):
     text = body.get("text", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Extract entities and relationships from the provided text according to these EXACT rules:\n"
+        "Extract EVERY entity and relationship from the text. Be exhaustive.\n"
         "Allowed Entity Types: Person, Organization, Product, Framework\n"
-        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED\n\n"
+        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED\n\n"
         "Return strictly JSON in this format:\n"
         "{\n"
         "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"AllowedType\"}],\n"
