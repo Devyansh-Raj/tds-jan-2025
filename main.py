@@ -199,45 +199,82 @@ async def root():
 # ================= Q3: /q3/answer =================
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
-    body = await request.json()
-    question = body.get("question", "")
-    chunks = body.get("chunks", [])
+    try:
+        body = await request.json()
+    except Exception:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
+    question = str(body.get("question", "") or "").strip()
+    chunks = body.get("chunks", []) or []
+
+    if not question or not chunks:
+        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
+    valid_ids = {str(c.get("chunk_id", "")) for c in chunks if isinstance(c, dict)}
+    valid_ids_lower = {cid.lower(): cid for cid in valid_ids}
+
     prompt = (
-        "You are an infallible compliance QA validator. Determine if the question can be answered using the provided context chunks.\n"
-        "Rules:\n"
-        "1. If the information is missing, ambiguous, or cannot be directly proven from the chunks, you MUST set answerable to false, answer to 'I don't know', citations to [], and confidence to 0.1.\n"
-        "2. If it can be answered, set answerable to true, provide a concise factual answer, list ONLY the exact chunk_ids used, and set confidence between 0.85 and 1.0.\n"
-        "Return strictly a JSON object with keys: answerable (boolean), answer (string), citations (array of strings), confidence (float).\n\n"
+        "You are a strict grounded-QA system for medical/legal compliance. Answer ONLY using text "
+        "explicitly and literally present in the chunks below. Never use outside knowledge. Never "
+        "infer, guess, or combine facts unless the combination is itself directly stated in a chunk.\n\n"
+        "Decision rule:\n"
+        "- ANSWERABLE only if at least one chunk explicitly states the answer.\n"
+        "- UNANSWERABLE if the chunks are silent, off-topic, only tangentially related, ambiguous, "
+        "or require outside knowledge/inference beyond what is literally written. When in doubt, "
+        "choose UNANSWERABLE.\n\n"
+        "Example 1:\n"
+        "CHUNKS: [{\"chunk_id\":\"C1\",\"text\":\"FAISS was open-sourced in 2017.\"}]\n"
+        "Q: What year was FAISS released?\n"
+        "A: {\"answerable\": true, \"answer\": \"FAISS was open-sourced in 2017.\", "
+        "\"citations\": [\"C1\"], \"confidence\": 0.95}\n\n"
+        "Example 2:\n"
+        "CHUNKS: [{\"chunk_id\":\"C3\",\"text\":\"ChromaDB is an open-source embedding database.\"}]\n"
+        "Q: What year was ChromaDB released?\n"
+        "A: {\"answerable\": false, \"answer\": \"I don't know\", \"citations\": [], \"confidence\": 0.1}\n\n"
+        "Return STRICTLY a JSON object with exactly these keys: answerable (boolean), answer (string), "
+        "citations (array of chunk_id strings ONLY -- not objects), confidence (float).\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
+
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1000))
-        
-        # Rigorous boolean conversion
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=600)
+        out = parse_json(raw)
+
         is_answerable = out.get("answerable")
         if isinstance(is_answerable, str):
-            is_answerable = is_answerable.lower() == "true"
+            is_answerable = is_answerable.strip().lower() == "true"
         else:
             is_answerable = bool(is_answerable)
 
-        confidence = float(out.get("confidence", 0.9))
-        
-        if not is_answerable or confidence <= 0.3:
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-            
-        valid_ids = {c["chunk_id"] for c in chunks}
-        cites = [str(c) for c in out.get("citations", []) if str(c) in valid_ids]
-        
-        # If model claimed answerable=true but gave no citations, force unanswerable fallback
-        if not cites:
+        try:
+            confidence = float(out.get("confidence", 0.1))
+        except (TypeError, ValueError):
+            confidence = 0.1
+
+        if not is_answerable:
+            return {"answer": "I don't know", "citations": [], "confidence": min(confidence, 0.3), "answerable": False}
+
+        # Defensive citation parsing: model sometimes returns {"chunk_id": "C1"} instead of "C1",
+        # or the wrong case -- resolve both against the real chunk IDs before giving up on them.
+        resolved = []
+        for c in (out.get("citations", []) or []):
+            cid = c.get("chunk_id") if isinstance(c, dict) else c
+            cid = str(cid).strip()
+            if cid in valid_ids:
+                resolved.append(cid)
+            elif cid.lower() in valid_ids_lower:
+                resolved.append(valid_ids_lower[cid.lower()])
+        resolved = list(dict.fromkeys(resolved))
+
+        if not resolved:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
         return {
-            "answer": str(out.get("answer", "I don't know")),
-            "citations": cites,
-            "confidence": confidence,
-            "answerable": True
+            "answer": str(out.get("answer", "")).strip() or "I don't know",
+            "citations": resolved,
+            "confidence": max(0.31, min(confidence, 1.0)),
+            "answerable": True,
         }
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
@@ -299,23 +336,42 @@ async def extract_graph(request: Request):
     body = await request.json()
     text = body.get("text", "")
     prompt = (
-        "You are an exhaustive GraphRAG Entity and Relationship extractor.\n"
-        "Extract ALL entities and relationships from the text without omitting anything.\n"
-        "Allowed Entity Types: Person, Organization, Product, Framework\n"
-        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED, CREATOR\n"
-        "Map any creation or authoring relation to 'CREATED' or 'FOUNDED' if it fits best, or use standard terms.\n"
-        "Return strictly a JSON object in this exact format:\n"
+        "You are a meticulous GraphRAG entity/relationship extractor. Your goal is COMPLETENESS: "
+        "find every entity and every relationship stated in the text, not just the most obvious one.\n\n"
+        "Allowed entity types (pick the single best fit): Person, Organization, Product, Framework.\n"
+        "Allowed relationship types (pick the single best fit): FOUNDED, DEVELOPED, INTEGRATED_INTO, "
+        "HIRED, AUTHORED, CREATED.\n\n"
+        "Instructions:\n"
+        "1. Go sentence by sentence. In EACH sentence, list every named entity mentioned -- people, "
+        "companies, products, frameworks/libraries -- even ones mentioned only once or in passing.\n"
+        "2. For EVERY pair of entities the text explicitly connects (creation, founding, development, "
+        "integration, hiring, authorship), emit one relationship object. A single sentence can contain "
+        "more than one relationship -- extract all of them, don't stop after the first.\n"
+        "3. Never drop or merge entities/relationships. Use entity names exactly as written in the text.\n\n"
+        "Example (showing multiple relationships from one short text):\n"
+        "TEXT: \"LangChain was created by Harrison Chase and provides a framework for building LLM "
+        "applications. It integrates with OpenAI's models and with the Pinecone vector database.\"\n"
         "{\n"
-        "  \"entities\": [{\"name\": \"Name\", \"type\": \"Person/Organization/Product/Framework\"}],\n"
-        "  \"relationships\": [{\"source\": \"SourceEntity\", \"target\": \"TargetEntity\", \"relation\": \"FOUNDED/DEVELOPED/INTEGRATED_INTO/HIRED/AUTHORED/CREATED\"}]\n"
-        "}\n\n"
+        "  \"entities\": [\n"
+        "    {\"name\": \"LangChain\", \"type\": \"Framework\"},\n"
+        "    {\"name\": \"Harrison Chase\", \"type\": \"Person\"},\n"
+        "    {\"name\": \"OpenAI\", \"type\": \"Organization\"},\n"
+        "    {\"name\": \"Pinecone\", \"type\": \"Product\"}\n"
+        "  ],\n"
+        "  \"relationships\": [\n"
+        "    {\"source\": \"Harrison Chase\", \"target\": \"LangChain\", \"relation\": \"CREATED\"},\n"
+        "    {\"source\": \"LangChain\", \"target\": \"OpenAI\", \"relation\": \"INTEGRATED_INTO\"},\n"
+        "    {\"source\": \"LangChain\", \"target\": \"Pinecone\", \"relation\": \"INTEGRATED_INTO\"}\n"
+        "  ]\n"
+        "}\n"
+        "Note: all THREE relationships were captured, not just the first one.\n\n"
+        "Return STRICTLY a JSON object with exactly two keys, \"entities\" and \"relationships\", in the "
+        "same schema as the example. No extra keys, no markdown fences, no commentary.\n\n"
         f"TEXT:\n{text}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        entities = out.get("entities", [])
-        relationships = out.get("relationships", [])
-        return {"entities": entities, "relationships": relationships}
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=2000))
+        return {"entities": out.get("entities", []) or [], "relationships": out.get("relationships", []) or []}
     except Exception:
         return {"entities": [], "relationships": []}
 
