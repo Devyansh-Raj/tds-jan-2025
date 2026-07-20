@@ -220,7 +220,7 @@ async def q3_answer(request: Request):
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1000))
         if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
         valid_ids = [c["chunk_id"] for c in chunks]
