@@ -1,0 +1,11 @@
+name: Keep Render Alive
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:          # lets you trigger it manually too
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping app
+        run: curl -sf https://tds-jan-2025.onrender.com/ || true
