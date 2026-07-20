@@ -203,35 +203,40 @@ async def q3_answer(request: Request):
     question = body.get("question", "")
     chunks = body.get("chunks", [])
     prompt = (
-        "You are a strict Grounded QA API. Evaluate if the question can be answered strictly using ONLY the provided chunks.\n"
-        "If the chunks lack the explicit information, you MUST return:\n"
-        '{"answerable": false, "answer": "I don\'t know", "citations": [], "confidence": 0.1}\n'
-        "If the chunks DO contain the information, return:\n"
-        '{"answerable": true, "answer": "<factual answer>", "citations": ["C1", "C2"], "confidence": 0.95}\n'
-        "Return strictly JSON.\n\n"
+        "You are an infallible compliance QA validator. Determine if the question can be answered using the provided context chunks.\n"
+        "Rules:\n"
+        "1. If the information is missing, ambiguous, or cannot be directly proven from the chunks, you MUST set answerable to false, answer to 'I don't know', citations to [], and confidence to 0.1.\n"
+        "2. If it can be answered, set answerable to true, provide a concise factual answer, list ONLY the exact chunk_ids used, and set confidence between 0.85 and 1.0.\n"
+        "Return strictly a JSON object with keys: answerable (boolean), answer (string), citations (array of strings), confidence (float).\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1000))
         
-        # Safely parse the boolean in case the LLM returns a string like "false"
-        is_answerable = out.get("answerable", False)
-        if str(is_answerable).lower() in ["false", "0", "none", ""]:
-            is_answerable = False
+        # Rigorous boolean conversion
+        is_answerable = out.get("answerable")
+        if isinstance(is_answerable, str):
+            is_answerable = is_answerable.lower() == "true"
         else:
-            is_answerable = True
-            
-        if not is_answerable or float(out.get("confidence", 1.0)) <= 0.3:
+            is_answerable = bool(is_answerable)
+
+        confidence = float(out.get("confidence", 0.9))
+        
+        if not is_answerable or confidence <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
             
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
+        valid_ids = {c["chunk_id"] for c in chunks}
+        cites = [str(c) for c in out.get("citations", []) if str(c) in valid_ids]
         
+        # If model claimed answerable=true but gave no citations, force unanswerable fallback
+        if not cites:
+            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
         return {
-            "answer": out.get("answer", "I don't know"),
+            "answer": str(out.get("answer", "I don't know")),
             "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
+            "confidence": confidence,
             "answerable": True
         }
     except Exception:
@@ -288,25 +293,29 @@ async def vector_search(request: Request):
     return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
 
 # ================= Q5: GraphRAG Endpoints =================
+# ================= Q5: GraphRAG Endpoints =================
 @app.post("/extract-graph")
 async def extract_graph(request: Request):
     body = await request.json()
     text = body.get("text", "")
     prompt = (
-        "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Extract EVERY entity and relationship from the text. Be exhaustive.\n"
+        "You are an exhaustive GraphRAG Entity and Relationship extractor.\n"
+        "Extract ALL entities and relationships from the text without omitting anything.\n"
         "Allowed Entity Types: Person, Organization, Product, Framework\n"
-        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED\n\n"
-        "Return strictly JSON in this format:\n"
+        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED, CREATOR\n"
+        "Map any creation or authoring relation to 'CREATED' or 'FOUNDED' if it fits best, or use standard terms.\n"
+        "Return strictly a JSON object in this exact format:\n"
         "{\n"
-        "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"AllowedType\"}],\n"
-        "  \"relationships\": [{\"source\": \"Entity1\", \"target\": \"Entity2\", \"relation\": \"ALLOWED_RELATION\"}]\n"
+        "  \"entities\": [{\"name\": \"Name\", \"type\": \"Person/Organization/Product/Framework\"}],\n"
+        "  \"relationships\": [{\"source\": \"SourceEntity\", \"target\": \"TargetEntity\", \"relation\": \"FOUNDED/DEVELOPED/INTEGRATED_INTO/HIRED/AUTHORED/CREATED\"}]\n"
         "}\n\n"
         f"TEXT:\n{text}"
     )
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
+        entities = out.get("entities", [])
+        relationships = out.get("relationships", [])
+        return {"entities": entities, "relationships": relationships}
     except Exception:
         return {"entities": [], "relationships": []}
 
